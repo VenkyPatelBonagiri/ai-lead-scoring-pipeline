@@ -1,0 +1,1059 @@
+{
+  "name": "WF3 – Contact agent",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -336,
+        -16
+      ],
+      "id": "702be0f5-3374-4762-b64f-52fcfac4dd73",
+      "name": "Start (manual)"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "status",
+              "lookupValue": "enriched"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -128,
+        -16
+      ],
+      "id": "7301f1c1-8668-4fd1-b236-c48b04f07f52",
+      "name": "Read enriched leads",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "627a142a-63d7-4f21-afa2-e3efefa7678c",
+              "leftValue": "={{ [\"A\", \"B\"].includes($json.priority) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "d3465ecd-5f4d-4a0d-8f67-c9d5a268e3e5",
+              "leftValue": "={{ $json.contact_email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        80,
+        -16
+      ],
+      "id": "d6b279b4-9075-44a5-ad8a-d1a1521c6e1b",
+      "name": "A/B leads without email"
+    },
+    {
+      "parameters": {
+        "maxItems": 5
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        496,
+        -16
+      ],
+      "id": "0246ebd1-50f9-4afa-a641-a240985c514f",
+      "name": "Limit (Hunter credits)"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        704,
+        -16
+      ],
+      "id": "08d216cc-2488-4143-837f-b06970e1c426",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "sortFieldsUi": {
+          "sortField": [
+            {
+              "fieldName": "score",
+              "order": "descending"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.sort",
+      "typeVersion": 1,
+      "position": [
+        288,
+        -16
+      ],
+      "id": "04517b0d-e812-4ad1-8127-4148b308ee05",
+      "name": "Sort by score"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Find the best decision-maker contact at this Berlin property management company.\n\nCompany: {{ $json.company_name }}\nLegal name: {{ $json.legal_name }}\nWebsite: {{ $json.website }}\nDomain: {{ $json.domain }}\nAlready known from the Impressum: {{ $json.contact_name }} ({{ $json.contact_role }})\nGeneral email: {{ $json.general_email }}\nPages already read: {{ $json.evidence_urls }}\nCompany type: {{ $json.core_business }}, size: {{ $json.size_category }}, consolidator: {{ $json.consolidator }}",
+        "options": {
+          "systemMessage": "You are a B2B contact research agent for Heidi Systems, a Berlin metering service provider (digital heating/water meters and heating cost billing). Your goal: for one property management company, find the best person to talk to about switching metering provider, plus a personal business email and LinkedIn profile.\n\nWHO IS THE RIGHT PERSON:\n- Small/medium companies: the Geschäftsführer/owner (usually already known from the Impressum and given in the input).\n- Large companies or consolidators: prefer the head of WEG management, Hausverwaltung, property management or Betriebskosten/Abrechnung if Hunter or search results show one; otherwise the Geschäftsführer.\n\nTOOLS (use the fewest calls needed, max ~5):\n1. hunter_domain_search: returns the company's email pattern, known emails, positions and sometimes LinkedIn URLs. Call this ONCE per company, first.\n2. hunter_email_finder: finds and verifies the email for a specific first + last name at the domain. Use only for the chosen person, and only if domain search did not already return their email.\n3. web_search: Google search. Use for LinkedIn: site:linkedin.com/in \"First Last\" \"Company\"\n\nREQUIRED STEPS:\n- Always call hunter_domain_search once.\n- If it did not return an email for the chosen person, call hunter_email_finder for that person.\n- If no LinkedIn URL was found yet, try web_search once.\n- The decision-maker from the Impressum is already given in the input. Choose a more relevant person (e.g. head of WEG/Hausverwaltung) only if Hunter or search results clearly show one.\n\nSTRICT RULES — NEVER INVENT DATA:\n- Only return an email that came from (a) the website (given in the input), (b) Hunter results, or (c) the company's known Hunter pattern applied to the person's name. Label which one in email_source.\n- A LinkedIn URL must come from search results or Hunter data, be a linkedin.com/in/ profile, and the name AND company must match. Use \"confirmed\" only if search results show the profile with the matching company; use \"likely\" if it comes only from Hunter or the company match is uncertain. Otherwise return null.\n- If unsure, return null and explain in notes. A null is better than a wrong contact.\n- Do not use generic addresses (info@, kontakt@, office@, post@) as contact_email.\n- Mention other relevant decision-makers you found (name + role) in notes.\n\nReturn ONLY valid JSON, no markdown:\n{\n  \"contact_name\": string|null,\n  \"contact_role\": string|null,\n  \"why_this_person\": string,\n  \"contact_email\": string|null,\n  \"email_source\": \"website\" | \"hunter_verified\" | \"hunter_found\" | \"pattern\" | \"not_found\",\n  \"hunter_score\": number|null,\n  \"linkedin_url\": string|null,\n  \"linkedin_match\": \"confirmed\" | \"likely\" | \"not_found\",\n  \"steps_taken\": string,\n  \"notes\": string|null\n}\n\nYour final answer must be ONLY the JSON object — no summary, no markdown, no text before or after it."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        960,
+        -192
+      ],
+      "id": "fec18a53-b271-40b3-90c7-b9abed8d2504",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "toolDescription": "Get the email pattern and known emails for a company domain from Hunter.io. Input: domain like example.de.",
+        "url": "https://api.hunter.io/v2/domain-search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "domain",
+              "value": "={{ $fromAI('domain', 'Company domain without www', 'string') }}"
+            },
+            {
+              "name": "limit",
+              "value": "10"
+            }
+          ]
+        },
+        "options": {},
+        "optimizeResponse": true,
+        "fieldsToInclude": "selected",
+        "fields": "data.pattern, data.organization, data.emails"
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.4,
+      "position": [
+        1200,
+        192
+      ],
+      "id": "a7630cbb-8fb1-4ca5-847b-c7ca3929c7db",
+      "name": "hunter_domain_search",
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Hunter API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "toolDescription": "Find and verify the business email of a specific person at a domain via Hunter.io. Inputs: domain, first_name, last_name.",
+        "url": "https://api.hunter.io/v2/email-finder",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "domain",
+              "value": "={{ $fromAI('domain', 'Company domain', 'string') }}"
+            },
+            {
+              "name": "first_name",
+              "value": "={{ $fromAI('first_name', 'First name of the person', 'string') }}"
+            },
+            {
+              "name": "last_name",
+              "value": "={{ $fromAI('last_name', 'Last name of the person', 'string') }}"
+            }
+          ]
+        },
+        "options": {},
+        "optimizeResponse": true,
+        "fieldsToInclude": "selected",
+        "fields": "data.email, data.score, data.verification, data.position"
+      },
+      "type": "n8n-nodes-base.httpRequestTool",
+      "typeVersion": 4.4,
+      "position": [
+        1456,
+        176
+      ],
+      "id": "a2a05031-e119-4907-99e7-6387c2062033",
+      "name": "hunter_email_finder",
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Hunter API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Google search. Use it to find LinkedIn profiles of a person, e.g. site:linkedin.com/in \"First Last\" \"Company name\". Input: search query.",
+        "q": "={{ $fromAI('query', 'Google search query, e.g. site:linkedin.com/in \"First Last\" \"Company\"', 'string') }}",
+        "additionalFields": {
+          "gl": "de",
+          "hl": "de"
+        },
+        "requestOptions": {}
+      },
+      "type": "n8n-nodes-serpapi.serpApiTool",
+      "typeVersion": 1,
+      "position": [
+        1648,
+        64
+      ],
+      "id": "fdbaa39f-da09-451a-98b9-7692f0669dd1",
+      "name": "Google search in SerpApi",
+      "credentials": {
+        "serpApi": {
+          "name": "SerpAPI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-haiku-5-5",
+          "mode": "list",
+          "cachedResultName": "Claude Haiku 5.5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        128
+      ],
+      "id": "8eb2367f-1852-485a-b474-bf1d38a266da",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "place_id": "={{ $json.place_id }}",
+            "contact_name": "={{ $json.parsed.contact_name || $('Loop Over Items').item.json.contact_name }}",
+            "contact_role": "={{ $json.parsed.contact_role || $('Loop Over Items').item.json.contact_role }}",
+            "contact_email": "={{ /^(info|kontakt|office|post|mail|hallo|hello|service|verwaltung)@/i.test($json.parsed.contact_email || '') ? '' : ($json.parsed.contact_email || '') }}",
+            "email_confidence": "={{ ({ website: 'Verified (on website)', hunter_verified: 'Verified (Hunter)', hunter_found: 'Found (Hunter, not verified)', pattern: 'Pattern guess (unverified)' })[$json.parsed.email_source] || 'Not found' }}",
+            "linkedin_url": "={{ /linkedin\\.com\\/in\\//i.test($json.parsed.linkedin_url || '') ? $json.parsed.linkedin_url + ($json.parsed.linkedin_match === 'likely' ? ' (likely match)' : '') : '' }}",
+            "contact_notes": "={{ ($json.parsed.why_this_person || '') + ' | steps: ' + ($json.parsed.steps_taken || '') + ($json.parsed.notes ? ' | ' + $json.parsed.notes : '') }}"
+          },
+          "matchingColumns": [
+            "place_id"
+          ],
+          "schema": [
+            {
+              "id": "place_id",
+              "displayName": "place_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_name",
+              "displayName": "company_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "generic_name",
+              "displayName": "generic_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "street",
+              "displayName": "street",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "postal_code",
+              "displayName": "postal_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "district",
+              "displayName": "district",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "city",
+              "displayName": "city",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "phone",
+              "displayName": "phone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_category",
+              "displayName": "google_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "all_categories",
+              "displayName": "all_categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "broker_hint",
+              "displayName": "broker_hint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_rating",
+              "displayName": "google_rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_reviews",
+              "displayName": "google_reviews",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "maps_url",
+              "displayName": "maps_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "search_string",
+              "displayName": "search_string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "scraped_at",
+              "displayName": "scraped_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "legal_name",
+              "displayName": "legal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "core_business",
+              "displayName": "core_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_weg",
+              "displayName": "manages_weg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_whole_buildings",
+              "displayName": "manages_whole_buildings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "does_billing",
+              "displayName": "does_billing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "property_focus",
+              "displayName": "property_focus",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "units_stated",
+              "displayName": "units_stated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "size_category",
+              "displayName": "size_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "digital_level",
+              "displayName": "digital_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "association",
+              "displayName": "association",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "energy_signal",
+              "displayName": "energy_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "growth_signal",
+              "displayName": "growth_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "own_metering",
+              "displayName": "own_metering",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "consolidator",
+              "displayName": "consolidator",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "existing_customer",
+              "displayName": "existing_customer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "metering_providers",
+              "displayName": "metering_providers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "berlin_presence",
+              "displayName": "berlin_presence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "years_in_business",
+              "displayName": "years_in_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "red_flag",
+              "displayName": "red_flag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_reason",
+              "displayName": "score_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_breakdown",
+              "displayName": "score_breakdown",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "data_confidence",
+              "displayName": "data_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "needs_review",
+              "displayName": "needs_review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "general_email",
+              "displayName": "general_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_name",
+              "displayName": "contact_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_role",
+              "displayName": "contact_role",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_email",
+              "displayName": "contact_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_confidence",
+              "displayName": "email_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "linkedin_url",
+              "displayName": "linkedin_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enriched_at",
+              "displayName": "enriched_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_urls",
+              "displayName": "evidence_urls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_notes",
+              "displayName": "contact_notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1824,
+        -192
+      ],
+      "id": "32ba365b-224d-436e-9643-bb92ad7649af",
+      "name": "Write contact to sheet",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 2
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1968,
+        -416
+      ],
+      "id": "0d931670-8077-4efa-a00e-06d03db52b0a",
+      "name": "Wait"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "90dbe109-82dc-4f5d-b9a4-47e3742e2d79",
+              "name": "place_id",
+              "value": "={{ $('Loop Over Items').first().json.place_id }}",
+              "type": "string"
+            },
+            {
+              "id": "61b9c21f-9b71-4e3d-9862-f10c83f25609",
+              "name": "parsed",
+              "value": "={{ (() => { const s = String($json.output || \"\"); const f = s.match(/```json\\s*([\\s\\S]*?)```/i); const b = f ? f[1] : s; try { return JSON.parse(b.slice(b.indexOf(\"{\"), b.lastIndexOf(\"}\") + 1)); } catch (e) { return {}; } })() }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1312,
+        -192
+      ],
+      "id": "8e59f819-0e90-46bd-8eae-0374cf0ad422",
+      "name": "Parse agent JSON"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start (manual)": {
+      "main": [
+        [
+          {
+            "node": "Read enriched leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read enriched leads": {
+      "main": [
+        [
+          {
+            "node": "A/B leads without email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A/B leads without email": {
+      "main": [
+        [
+          {
+            "node": "Sort by score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit (Hunter credits)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sort by score": {
+      "main": [
+        [
+          {
+            "node": "Limit (Hunter credits)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "hunter_domain_search": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "hunter_email_finder": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google search in SerpApi": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse agent JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write contact to sheet": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse agent JSON": {
+      "main": [
+        [
+          {
+            "node": "Write contact to sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "tags": []
+}

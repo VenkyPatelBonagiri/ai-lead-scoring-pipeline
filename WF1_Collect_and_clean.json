@@ -1,0 +1,353 @@
+{
+  "name": "WF1 – Collect and clean",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -128,
+        -128
+      ],
+      "id": "d723ad71-d07d-4267-b423-82d5f8825120",
+      "name": "Start (manual)"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================\n// Clean + normalize + filter + dedupe\n// Input:  raw Google Maps places from Apify\n// Output: one clean row per unique company\n// =====================================================\n\n// ---------- helpers ----------\n\n// Remove SEO keyword stuffing from Google titles\nconst cleanName = (t = \"\") => {\n  let n = String(t).split(\"|\")[0];                          // \"PANDION SERVICE | Hausverwaltung Berlin\" → \"PANDION SERVICE\"\n  n = n.replace(/,\\s*(Makler|Immobilienmakler).*$/i, \"\");    // \"Galant ..., Makler, Immobilienmakler\" → \"Galant ...\"\n  return n.replace(/\\s+/g, \" \").trim();\n};\n\n// Reduce any URL to clean homepage + domain (regex, no URL object needed)\nconst cleanWebsite = (url) => {\n  if (!url) return { website: \"\", domain: \"\" };\n  const m = String(url).trim().match(/^(https?:\\/\\/)?([^\\/?#:]+)/i);\n  if (!m) return { website: String(url), domain: \"\" };\n  const host = m[2].toLowerCase();\n  const domain = host.replace(/^www\\./, \"\");\n  const protocol = (m[1] || \"https://\").toLowerCase();\n  return { website: `${protocol}${host}/`, domain };\n};\n\n// Berlin postcode range check\nconst isBerlinPLZ = (plz) => {\n  const p = parseInt(plz, 10);\n  return !isNaN(p) && p >= 10115 && p <= 14199;\n};\n\n// Approximate postcode → district mapping (some postcodes cross borders)\nconst PLZ_RANGES = [\n  [10115,10119,\"Mitte\"],[10178,10179,\"Mitte\"],[10551,10559,\"Mitte\"],[10785,10785,\"Mitte\"],[13347,13359,\"Mitte\"],\n  [10243,10249,\"Friedrichshain-Kreuzberg\"],[10961,10999,\"Friedrichshain-Kreuzberg\"],\n  [10405,10439,\"Pankow\"],[13086,13089,\"Pankow\"],[13125,13129,\"Pankow\"],[13156,13189,\"Pankow\"],\n  [10315,10369,\"Lichtenberg\"],[13051,13059,\"Lichtenberg\"],\n  [10585,10589,\"Charlottenburg-Wilmersdorf\"],[10623,10629,\"Charlottenburg-Wilmersdorf\"],\n  [10707,10719,\"Charlottenburg-Wilmersdorf\"],[14050,14059,\"Charlottenburg-Wilmersdorf\"],\n  [14193,14199,\"Charlottenburg-Wilmersdorf\"],[13627,13629,\"Charlottenburg-Wilmersdorf\"],\n  [10777,10789,\"Tempelhof-Schöneberg\"],[10823,10829,\"Tempelhof-Schöneberg\"],[12099,12109,\"Tempelhof-Schöneberg\"],\n  [12277,12279,\"Tempelhof-Schöneberg\"],[12305,12309,\"Tempelhof-Schöneberg\"],\n  [12043,12059,\"Neukölln\"],[12347,12359,\"Neukölln\"],\n  [12157,12169,\"Steglitz-Zehlendorf\"],[12203,12209,\"Steglitz-Zehlendorf\"],[12247,12249,\"Steglitz-Zehlendorf\"],\n  [14109,14169,\"Steglitz-Zehlendorf\"],\n  [12435,12459,\"Treptow-Köpenick\"],[12487,12489,\"Treptow-Köpenick\"],[12524,12527,\"Treptow-Köpenick\"],\n  [12555,12559,\"Treptow-Köpenick\"],[12587,12589,\"Treptow-Köpenick\"],\n  [12619,12689,\"Marzahn-Hellersdorf\"],\n  [13403,13509,\"Reinickendorf\"],\n  [13581,13599,\"Spandau\"],[14089,14089,\"Spandau\"],\n];\n\n// District: postcode first (reliable), Google neighborhood as fallback\nconst getDistrict = (plz, neighborhood) => {\n  const p = parseInt(plz, 10);\n  if (!isNaN(p)) {\n    const hit = PLZ_RANGES.find(([a, b]) => p >= a && p <= b);\n    if (hit) return hit[2];\n  }\n  return neighborhood ? String(neighborhood).replace(/^Bezirk\\s+/i, \"\").trim() : \"Unknown\";\n};\n\n// Is this place in Berlin? Unknown location → keep (we only searched Berlin)\nconst inBerlin = (p) => {\n  const city = (p.city || \"\").toLowerCase();\n  if (city) return city.includes(\"berlin\");\n  if (p.postalCode) return isBerlinPLZ(p.postalCode);\n  return true;\n};\n\n// ---------- normalize ----------\nconst raw = $input.all();\n\nconst rows = raw.map(({ json: p }) => {\n  const { website, domain } = cleanWebsite(p.website);\n  const name = cleanName(p.title);\n  const cats = Array.isArray(p.categories) ? p.categories : [];\n  return {\n    place_id: p.placeId || \"\",\n    company_name: name,\n    generic_name: /^(haus|immobilien)verwaltung$/i.test(name) ? \"yes\" : \"no\",\n    website,\n    domain,\n    street: p.street || \"\",\n    postal_code: p.postalCode || \"\",\n    district: getDistrict(p.postalCode, p.neighborhood),\n    city: p.city || \"Berlin\",\n    phone: p.phoneUnformatted || p.phone || \"\",\n    google_category: p.categoryName || \"\",\n    all_categories: cats.join(\", \"),\n    broker_hint: cats.some(c => /makler|vermittlung|agentur/i.test(c)) ? \"yes\" : \"no\",\n    google_rating: p.totalScore ?? \"\",\n    google_reviews: p.reviewsCount ?? 0,\n    maps_url: p.url || \"\",\n    search_string: p.searchString || \"\",\n    source: \"Google Maps (Apify)\",\n    scraped_at: p.scrapedAt || new Date().toISOString(),\n    status: website ? \"new\" : \"no_website\",\n    _closed: p.permanentlyClosed === true,\n    _berlin: inBerlin(p),\n  };\n});\n\n// ---------- filter: open + in Berlin ----------\nconst kept = rows.filter(r => !r._closed && r._berlin);\n\n// ---------- dedupe: place_id → domain → phone ----------\n// Sort by reviews first, so the entry with the most reviews is the one kept\nkept.sort((a, b) => (b.google_reviews || 0) - (a.google_reviews || 0));\n\nconst seen = new Set();\nconst unique = [];\nfor (const r of kept) {\n  const keys = [\n    r.place_id ? \"pid:\" + r.place_id : null,\n    r.domain ? \"dom:\" + r.domain : null,\n    r.phone ? \"tel:\" + r.phone.replace(/\\D/g, \"\") : null,\n  ].filter(Boolean);\n\n  if (keys.some(k => seen.has(k))) continue;   // duplicate → skip\n  keys.forEach(k => seen.add(k));\n\n  delete r._closed;\n  delete r._berlin;\n  unique.push(r);\n}\n\n// ---------- funnel stats ----------\nconsole.log(`Raw places: ${raw.length} | After filter: ${kept.length} | Unique companies: ${unique.length}`);\n\nreturn unique.map(r => ({ json: r }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        -128
+      ],
+      "id": "a882dfd7-9f56-4b4e-9865-d37fef232822",
+      "name": "Clean, dedupe, map districts"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "place_id",
+              "displayName": "place_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_name",
+              "displayName": "company_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "generic_name",
+              "displayName": "generic_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "street",
+              "displayName": "street",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "postal_code",
+              "displayName": "postal_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "district",
+              "displayName": "district",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "city",
+              "displayName": "city",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "phone",
+              "displayName": "phone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "google_category",
+              "displayName": "google_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "all_categories",
+              "displayName": "all_categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "broker_hint",
+              "displayName": "broker_hint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "google_rating",
+              "displayName": "google_rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "google_reviews",
+              "displayName": "google_reviews",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "maps_url",
+              "displayName": "maps_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "search_string",
+              "displayName": "search_string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "scraped_at",
+              "displayName": "scraped_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        544,
+        -128
+      ],
+      "id": "9b00e9c4-c17b-44a7-8c08-76b2016a5c0a",
+      "name": "Write leads to Google Sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.apify.com/v2/acts/compass~crawler-google-places/runs/last/dataset/items?clean=true",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        96,
+        -128
+      ],
+      "id": "38aa7b26-5ff5-47ab-a401-49685af8832e",
+      "name": "Fetch Apify results",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## WF1 – Collect and clean\nApify Google Maps run (started in the Apify console): 48 searches = 12 Berlin districts × 4 keywords, max 25 places each.\nThis workflow fetches the results, removes closed and non-Berlin places, dedupes on place ID → domain → phone, maps postcodes to districts and writes the leads to the sheet.\n**985 raw results → 758 unique companies**",
+        "height": 200,
+        "width": 820,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -176,
+        -400
+      ],
+      "id": "b1f0c0de-0000-4000-8000-000000000001",
+      "name": "Sticky Note"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Start (manual)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Apify results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Apify results": {
+      "main": [
+        [
+          {
+            "node": "Clean, dedupe, map districts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean, dedupe, map districts": {
+      "main": [
+        [
+          {
+            "node": "Write leads to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "tags": []
+}

@@ -1,0 +1,2096 @@
+{
+  "name": "WF2 – Enrich & Score",
+  "nodes": [
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "status",
+              "lookupValue": "new"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        48,
+        -304
+      ],
+      "id": "0764f922-a041-42ff-aaf5-ff886a747f30",
+      "name": "Get row(s) in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// =====================================================\n// Crawl website → clean text + emails + evidence URLs\n// Mode: Run Once for Each Item\n// v2: strips repeated navigation, skips listing/news pages,\n//     keeps only company + freemail addresses\n// =====================================================\nconst lead = $json;\nconst out = { ...lead, crawl_ok: false, crawl_error: \"\", site_text: \"\", emails_found: \"\", evidence_urls: \"\" };\n\nif (!lead.website) { out.crawl_error = \"no website\"; return { json: out }; }\n\nconst helpers = this.helpers;\nif (!helpers || !helpers.httpRequest) throw new Error(\"this.helpers.httpRequest not available in this n8n version\");\n\nconst UA = \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36\";\nconst origin = lead.website.replace(/\\/+$/, \"\");\nconst baseDomain = (lead.domain || \"\").toLowerCase();\nconst brand = baseDomain.split(\".\").slice(-2, -1)[0] || baseDomain;   // \"strategis\" from strategis.de\n\n// ---------- helpers ----------\nconst fetchHtml = async (url) => {\n  try {\n    const body = await helpers.httpRequest({\n      method: \"GET\", url,\n      headers: { \"User-Agent\": UA, \"Accept-Language\": \"de-DE,de;q=0.9\" },\n      timeout: 8000, json: false, skipSslCertificateValidation: true,\n    });\n    return typeof body === \"string\" ? body : (body ? String(body) : \"\");\n  } catch (e) { return \"\"; }\n};\n\nconst decode = (s) => s\n  .replace(/&nbsp;/g, \" \").replace(/&amp;/g, \"&\").replace(/&quot;/g, '\"').replace(/&#39;|&apos;/g, \"'\")\n  .replace(/&lt;/g, \"<\").replace(/&gt;/g, \">\").replace(/&shy;/g, \"\").replace(/&times;/g, \"\")\n  .replace(/&auml;/g, \"ä\").replace(/&ouml;/g, \"ö\").replace(/&uuml;/g, \"ü\")\n  .replace(/&Auml;/g, \"Ä\").replace(/&Ouml;/g, \"Ö\").replace(/&Uuml;/g, \"Ü\").replace(/&szlig;/g, \"ß\")\n  .replace(/&sect;/g, \"§\").replace(/&ndash;|&mdash;/g, \"–\")\n  .replace(/&#(\\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));\n\nconst htmlToText = (html) => decode(\n  html\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, \" \")\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, \" \")\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, \" \")\n    .replace(/<svg[\\s\\S]*?<\\/svg>/gi, \" \")\n    .replace(/<nav[\\s\\S]*?<\\/nav>/gi, \" \")        // drop navigation menus\n    .replace(/<form[\\s\\S]*?<\\/form>/gi, \" \")      // drop search/contact forms\n    .replace(/<(br|\\/p|\\/div|\\/li|\\/h\\d|\\/tr|\\/section)[^>]*>/gi, \"\\n\")\n    .replace(/<[^>]+>/g, \" \")\n).replace(/[ \\t]+/g, \" \").replace(/\\n\\s*\\n+/g, \"\\n\").trim();\n\nconst hostOf = (u) => { const m = u.match(/^https?:\\/\\/([^\\/?#:]+)/i); return m ? m[1].toLowerCase().replace(/^www\\./, \"\") : \"\"; };\nconst pathOf = (u) => { const m = u.match(/^https?:\\/\\/[^\\/?#]+(\\/[^?#]*)?/i); return (m && m[1]) ? m[1].toLowerCase() : \"/\"; };\n\nconst resolve = (href) => {\n  if (/^(mailto:|tel:|javascript:|#)/i.test(href)) return null;\n  if (/\\.(pdf|jpe?g|png|gif|zip|docx?|xlsx?)(\\?|$)/i.test(href)) return null;\n  if (/^https?:\\/\\//i.test(href)) return href;\n  if (href.startsWith(\"//\")) return \"https:\" + href;\n  if (href.startsWith(\"/\")) return origin + href;\n  return origin + \"/\" + href.replace(/^\\.\\//, \"\");\n};\n\n// Pages we never want: listings, news, jobs, legal boilerplate\nconst EXCLUDE = /\\/(immobilien|immobilienangebote|angebote|mietangebote|kaufangebote|wohnungssuche|wohnung-mieten|wohnung-kaufen|expose|objekte?|neuigkeiten|news|blog|presse|karriere|jobs|datenschutz|agb|cookie|login|ratgeber|referenzen|downloads|mediathek)(\\/|$)/i;\n\n// ---------- 1. homepage ----------\nlet homeUrl = lead.website;\nlet homeHtml = await fetchHtml(homeUrl);\nif (!homeHtml) {\n  homeUrl = homeUrl.startsWith(\"https://\") ? homeUrl.replace(\"https://\", \"http://\") : homeUrl.replace(\"http://\", \"https://\");\n  homeHtml = await fetchHtml(homeUrl);\n}\nif (!homeHtml) { out.crawl_error = \"website not reachable\"; return { json: out }; }\n\n// ---------- 2. find relevant subpages ----------\n// [category, URL-path regex, anchor-text regex, max pages]\nconst CATS = [\n  [\"impressum\", /impressum|imprint/i,                                                        /impressum|imprint/i, 1],\n  [\"services\",  /leistung|service|verwaltung|weg|sondereigentum/i,                           /leistung|verwaltung|service/i, 2],\n  [\"about\",     /\\/(ueber-uns|uber-uns|über-uns|about(-us)?|unternehmen|wir-ueber-uns|philosophie)(\\/|$)/i, /^(über uns|ueber uns|unternehmen|about( us)?|wir über uns)$/i, 1],\n  [\"team\",      /team|ansprechpartner|geschaeftsfuehrung|geschäftsführung/i,                 /team|ansprechpartner|geschäftsführung/i, 1],\n  [\"partner\",   /partner|kooperation/i,                                                       /partner/i, 1],\n];\n\nconst links = [];\nconst re = /<a\\s[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)<\\/a>/gi;\nlet m;\nwhile ((m = re.exec(homeHtml)) !== null) {\n  const abs = resolve(m[1].trim());\n  if (!abs) continue;\n  if (baseDomain && !hostOf(abs).endsWith(baseDomain)) continue;   // same site only\n  const url = abs.split(\"#\")[0];\n  if (EXCLUDE.test(pathOf(url))) continue;                          // skip listings/news/jobs\n  links.push({ url, path: pathOf(url), text: htmlToText(m[2]).toLowerCase().trim() });\n}\n\nconst picked = [];\nconst norm = (u) => u.replace(/^https?:\\/\\/(www\\.)?/i, \"\").replace(/\\/+$/, \"\").toLowerCase();\nconst used = new Set([norm(homeUrl)]);\nfor (const [cat, urlRx, textRx, max] of CATS) {\n  let count = 0;\n  for (const l of links) {\n    if (count >= max) break;\n    const key = norm(l.url);\n    if (used.has(key)) continue;\n    if (urlRx.test(l.path) || textRx.test(l.text)) {\n      picked.push({ cat, url: l.url });\n      used.add(key);\n      count++;\n    }\n  }\n}\nconst subpages = picked.slice(0, 5);\n\n// ---------- 3. fetch subpages ----------\nconst started = Date.now();\nconst pages = [{ cat: \"homepage\", url: homeUrl, html: homeHtml }];\nfor (const p of subpages) {\n  if (Date.now() - started > 25000) break;   // slow site → stop, use what we have\n  const html = await fetchHtml(p.url);\n  if (html) pages.push({ ...p, html });\n}\n\n// ---------- 4. emails: company domain + freemail only ----------\nconst FREEMAIL = /@(gmail\\.com|googlemail\\.com|web\\.de|gmx\\.(de|net)|t-online\\.de|outlook\\.(de|com)|hotmail\\.(de|com)|yahoo\\.(de|com)|freenet\\.de|arcor\\.de|posteo\\.de)$/;\nconst allHtml = pages.map(p => p.html).join(\" \").replace(/&#64;|\\[at\\]|\\(at\\)/gi, \"@\");\nconst emails = [...new Set((allHtml.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi) || [])\n  .map(e => e.toLowerCase())\n  .filter(e => !/\\.(png|jpe?g|gif|webp|svg)$/.test(e))\n  .filter(e => e.split(\"@\")[1].includes(brand) || FREEMAIL.test(e)))].slice(0, 10);\n\n// ---------- 5. text: remove lines already seen on the homepage (repeated menus/footers) ----------\nconst LIMITS = { homepage: 4000, impressum: 3000, services: 3500, about: 3000, team: 3000, partner: 2000 };\nconst seenLines = new Set();\nlet siteText = \"\";\nfor (const p of pages) {\n  const lines = htmlToText(p.html).split(\"\\n\").map(s => s.trim()).filter(Boolean);\n  const fresh = lines.filter(line => {\n    if (seenLines.has(line)) return false;     // already shown on an earlier page\n    seenLines.add(line);\n    return true;\n  });\n  const t = fresh.join(\"\\n\").slice(0, LIMITS[p.cat] || 2500);\n  siteText += `\\n\\n=== PAGE: ${p.cat.toUpperCase()} (${p.url}) ===\\n${t}`;\n}\n\nout.crawl_ok = true;\nout.site_text = siteText.slice(0, 18000);\nout.emails_found = emails.join(\", \");\nout.evidence_urls = pages.map(p => p.url).join(\" | \");\nreturn { json: out };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        -160
+      ],
+      "id": "51697792-fa2f-4128-929d-74a3d3cc6ad7",
+      "name": "Crawl website"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Segment each lead before spending LLM calls on it\nconst core = [\"Hausverwaltungsunternehmen\", \"Immobilienverwaltungsservice\"];\nconst broker = [\"Immobilienagentur\", \"Immobilienmakler\", \"Immobilienvermittlung\", \"Immobilienberater\", \"Wohnungsvermietungsagentur\"];\nconst housing = [\"Wohnungsbaugenossenschaft\", \"Wohnungsbaugesellschaft\", \"Sozialwohnungsbaugesellschaft\", \"Wohnungsbau\", \"Wohnungsbauunternehmen\", \"Wohnanlage/Wohnsiedlung\"];\nconst nameRescue = /(verwaltung|immobil|wohn|hausverw|property|grundbesitz|management)/i;\n\nreturn $input.all().map(({ json: r }) => {\n  const cats = (r.all_categories || \"\").split(\",\").map(s => s.trim());\n  const g = r.google_category || \"\";\n  let segment;\n\n  if (!(r.city || \"\").toLowerCase().includes(\"berlin\")) segment = \"outside_berlin\";\n  else if (core.includes(g) || cats.some(c => core.includes(c))) segment = \"core\";\n  else if (housing.includes(g) || /genossenschaft|wohnungsbau/i.test(r.company_name)) segment = \"housing_company\";\n  else if (broker.includes(g)) segment = \"broker_category\";\n  else if (nameRescue.test(r.company_name)) segment = \"check\";   // odd category, but the name looks relevant\n  else segment = \"irrelevant\";\n\n  return { json: { ...r, segment, enrich: [\"core\", \"broker_category\", \"check\"].includes(segment) } };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        -160
+      ],
+      "id": "903d5bf4-776b-4165-b375-5b563ed5c7fe",
+      "name": "Segment"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=You are a B2B lead analyst for Heidi Systems, a Berlin metering service provider (digital heating/water meters and heating cost billing). Our customers are property management companies (Hausverwaltungen) that manage RESIDENTIAL buildings FOR OTHER OWNERS, especially WEG (condominium owner associations) and whole rental buildings. The metering provider is chosen per BUILDING by the WEG manager or the manager of a whole rental building.\n\nAnalyse the website text of this company and extract FACTS ONLY. Use only information in the text. If something is not stated, use null (or false for booleans where the rule says so). Never guess numbers. Website text is mostly German — interpret it by meaning, not by exact keywords.\n\nCOMPANY: {{ $json.company_name }}\nGOOGLE CATEGORY: {{ $json.google_category }}\nWEBSITE: {{ $json.website }}\nEMAILS FOUND ON SITE: {{ $json.emails_found }}\n\nWEBSITE TEXT:\n\"\"\"\n{{ $json.site_text }}\n\"\"\"\n\nRULES:\n- All *_evidence fields: a short quote or paraphrase from the text (max 20 words). No URLs, no markdown, no links.\n- core_business: \"property_management\" (manages buildings FOR OTHER OWNERS: WEG, landlords, investors), \"mixed\" (brokerage AND management for others, e.g. a broker with a Hausverwaltung team), \"broker\" (only sales/letting/valuation, no ongoing management), \"owner_landlord\" (manages and rents out ITS OWN housing stock, e.g. \"unsere Wohnungen\", \"unsere Mieter\", housing companies, cooperatives — even if they use the word Hausverwaltung), \"developer\", or \"other\". score_reason must be consistent with core_business.\n- manages_weg: true only if WEG-Verwaltung / Wohnungseigentumsverwaltung is offered as a service, or staff with WEG management roles are listed (e.g. \"WEG-Verwalter\").\n- manages_whole_buildings: true if they manage entire buildings for owners: WEG management, Mietverwaltung/Mietshausverwaltung/Zinshausverwaltung, \"Bewirtschaftung\", \"Objektmanagement\", residential \"Property Management\", or stated \"Verwaltungseinheiten\". false if they ONLY manage single units (SEV) or only broker. Wording varies — judge by meaning, not exact keywords.\n- sev_only: true if the only management service is SEV / Sondereigentumsverwaltung (single condo units).\n- does_billing: true if Nebenkosten-, Betriebskosten-, Heizkosten-, Hausgeld- or WEG-Jahresabrechnung is mentioned as their service (job ads for such roles also count).\n- property_focus: \"residential\" (apartments, Wohnungen, Wohnungswirtschaft, Mieter, WEG), \"mixed\" (residential + commercial clearly both), \"commercial\" (offices/retail/logistics only), or \"unknown\" only if there is truly no hint.\n- units_stated: exact quote of MANAGED units/properties (e.g. \"7.000+ Verwaltungseinheiten\"). Do NOT use sold, brokered, rented-out, valued or \"bearbeitete\" units. null if none.\n- units_number: integer of managed units from units_stated, else null.\n- employees: integer if stated (e.g. \"rund 50 Mitarbeiter\" -> 50), else null.\n- digital_level: \"high\" (own software/platform, owner or tenant portal/app, digital owner meetings), \"medium\" (some digital tools: online portal, app, online forms, digital document access, online appointment booking), \"basic\" (just a website).\n- association: \"VDIV\", \"IVD\", \"both\", \"other\" or \"none\" (membership mentioned in text, including logos described in text).\n- energy_signal: true only if the COMPANY ITSELF works on energy topics for buildings: energy management, heating modernisation, energy consulting for owners, CO2/ESG reporting, EED/HeizkostenV/GEG compliance, smart/remote metering. NOT counted: energy-saving tips for tenants, notices about energy prices, Energieausweis for sales.\n- growth_signal: true if growing, hiring, new locations, acquisitions, \"switch to us\" campaigns.\n- own_metering: true only if THEY THEMSELVES offer metering/submetering/smart-metering services (they would be a competitor).\n- consolidator: true if they grow by acquiring/integrating other property managers or are a group of several management companies.\n- metering_providers: names of metering companies mentioned as partners (ista, Techem, Brunata, Minol, Kalo, Heidi, etc.), else [].\n- berlin_presence: \"hq\" if the Impressum address is in Berlin, \"branch\" if headquartered elsewhere but with a Berlin office, \"none\", or \"unknown\".\n- founding_year: integer if stated or clearly derivable (e.g. \"seit 1991\" -> 1991), else null. Do not derive from vague phrases like \"über 30 Jahre\".\n- decision_maker: the Geschäftsführer/Vorstand/owner from the Impressum (name + role). If several, take the first.\n- other_contacts: up to 3 other relevant people, preferring heads of WEG/Hausverwaltung/property management, with name + role.\n- personal_emails: emails from EMAILS FOUND that belong to a person (e.g. firstname.lastname@ or initial.lastname@), not info@/kontakt@/post@/office@.\n- score_reason: one short English sentence summarising why this is or is not a fit for Heidi. Must match core_business and the other fields.\n- data_confidence: \"high\" (clear services + Impressum), \"medium\" (partial info), \"low\" (very little text or unclear).\n- conflicts: ONLY real contradictions inside the text (e.g. two different unit counts for the same thing, two different addresses). Do NOT put explanations of your reasoning here. Otherwise null.\n\nReturn ONLY valid JSON, no markdown, no explanation, exactly in this structure:\n{\n  \"legal_name\": string|null,\n  \"core_business\": string,\n  \"manages_weg\": boolean,\n  \"manages_whole_buildings\": boolean,\n  \"sev_only\": boolean,\n  \"does_billing\": boolean,\n  \"property_focus\": string,\n  \"units_stated\": string|null,\n  \"units_number\": number|null,\n  \"employees\": number|null,\n  \"digital_level\": string,\n  \"digital_evidence\": string|null,\n  \"association\": string,\n  \"energy_signal\": boolean,\n  \"energy_evidence\": string|null,\n  \"growth_signal\": boolean,\n  \"growth_evidence\": string|null,\n  \"own_metering\": boolean,\n  \"consolidator\": boolean,\n  \"metering_providers\": string[],\n  \"berlin_presence\": string,\n  \"founding_year\": number|null,\n  \"decision_maker\": {\"name\": string|null, \"role\": string|null},\n  \"other_contacts\": [{\"name\": string, \"role\": string}],\n  \"personal_emails\": string[],\n  \"score_reason\": string,\n  \"data_confidence\": string,\n  \"conflicts\": string|null\n}",
+        "messages": {
+          "messageValues": []
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1232,
+        -544
+      ],
+      "id": "42e130b7-5896-424b-85f0-07b60b02affc",
+      "name": "Basic LLM Chain",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-haiku-5-5",
+          "mode": "list",
+          "cachedResultName": "Claude Haiku 5.5"
+        },
+        "options": {
+          "maxTokensToSample": 1500
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.5,
+      "position": [
+        1232,
+        -208
+      ],
+      "id": "8c3d0645-c26f-4eb9-99ba-379c08d6a2e1",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// =====================================================\n// Parse Claude JSON → guardrails → score → red flags → sheet row\n// Mode: Run Once for Each Item\n// =====================================================\nconst lead = $('Crawl website').item.json;\nconst raw = $json.text ?? $json.response?.generations?.[0]?.[0]?.text ?? \"\";\nconst now = new Date().toISOString();\n\n// ---------- 1. parse JSON safely ----------\nlet k = null, parseError = \"\";\ntry {\n  const cleaned = String(raw).replace(/```json|```/gi, \"\").trim();\n  k = JSON.parse(cleaned.slice(cleaned.indexOf(\"{\"), cleaned.lastIndexOf(\"}\") + 1));\n} catch (e) {\n  parseError = String(e.message || e);\n}\n\nif (!k) {\n  return { json: {\n    place_id: lead.place_id, status: \"enrich_failed\",\n    needs_review: \"yes – LLM output not parseable: \" + parseError.slice(0, 80),\n    evidence_urls: lead.evidence_urls || \"\", enriched_at: now,\n  }};\n}\n\n// ---------- 2. guardrails (code double-checks the LLM) ----------\nconst text = lead.site_text || \"\";\nconst guardNotes = [];\n\nif (/(betriebskosten|nebenkosten|heizkosten|hausgeld)[-\\s]?abrechnung|jahresabrechnung/i.test(text) && !k.does_billing) {\n  k.does_billing = true; guardNotes.push(\"billing set by keyword\");\n}\n\n// WEG evidence in the text (services or staff roles) overrides a missed classification.\n// Case-sensitive \"WEG\" so the German word \"weg\" (= away) does not match.\nconst wegEvidence = /\\bWEG[- ]?(Verwalt|Buchhalt)|Wohnungseigentumsverwalt|Wohnungseigentümergemeinschaft/.test(text);\nif (wegEvidence && !k.manages_weg && [\"broker\", \"mixed\", \"property_management\"].includes(k.core_business)) {\n  k.manages_weg = true;\n  guardNotes.push(\"WEG set by keyword\");\n  if (k.core_business === \"broker\") {\n    k.core_business = \"mixed\";\n    guardNotes.push(\"broker → mixed (has WEG team)\");\n  }\n}\n\nif (k.manages_weg) {\n  if (!k.manages_whole_buildings) guardNotes.push(\"whole_buildings implied by WEG\");\n  k.manages_whole_buildings = true;\n  k.does_billing = true;          // WEG managers must produce annual statements by law\n  k.sev_only = false;\n}\nif (k.sev_only) k.manages_whole_buildings = false;\nif (!k.units_number) k.units_stated = k.units_stated && /verwalt|betreu|einheiten/i.test(k.units_stated) ? k.units_stated : null;\n\n\n\n// ---------- 3. size category (stated numbers first, Google reviews as weak proxy) ----------\nconst units = Number(k.units_number) || 0;\nconst emp = Number(k.employees) || 0;\nconst reviews = Number(lead.google_reviews) || 0;\nlet size, sizePts;\nif (units >= 1000 || emp >= 20)      { size = \"Large\";  sizePts = 10; }\nelse if (units >= 200 || emp >= 6)   { size = \"Medium\"; sizePts = 10; }\nelse if (units > 0 || emp > 0)       { size = \"Small\";  sizePts = 5; }\nelse if (reviews >= 150)             { size = \"Medium (proxy: Google reviews)\"; sizePts = 7; }\nelse if (reviews >= 30)              { size = \"Small (proxy: Google reviews)\";  sizePts = 5; }\nelse                                 { size = \"Unknown\"; sizePts = 3; }\n\n// ---------- 4. existing Heidi customers (from heidi-systems.de logo list) ----------\nconst EXISTING = /\\b(vitec|dumax|harte hausverwaltung|raumgold|schleicher immobilien|niesen immobilien|neckar immobilienverwaltung|pro gera|werne immobilien)\\b/i;\nconst nameBlob = `${lead.company_name} ${k.legal_name || \"\"} ${lead.domain || \"\"}`;\nconst existing = EXISTING.test(nameBlob);\n\n// ---------- 5. scoring (weights = KPI_Definitions tab) ----------\nconst pts = {\n  core:    ({ property_management: 15, mixed: 8 })[k.core_business] || 0,\n  weg:     k.manages_weg ? 15 : 0,\n  whole:   k.manages_whole_buildings ? 10 : 0,\n  billing: k.does_billing ? 10 : 0,\n  focus:   ({ residential: 10, mixed: 5, unknown: 3 })[k.property_focus] || 0,\n  size:    sizePts,\n  digital: ({ high: 10, medium: 6, basic: 2 })[k.digital_level] || 0,\n  vdiv:    [\"VDIV\", \"both\"].includes(k.association) ? 10 : 0,\n  energy:  k.energy_signal ? 5 : 0,\n  growth:  k.growth_signal ? 5 : 0,\n};\nconst score = Object.values(pts).reduce((a, b) => a + b, 0);\nconst breakdown = Object.entries(pts).map(([kk, v]) => `${kk} ${v}`).join(\" · \");\n\n// ---------- 6. red flags (override the score) ----------\nconst flags = [];\nif (existing)                              flags.push(\"Existing Heidi customer\");\nif (k.own_metering)                        flags.push(\"Competitor – own metering\");\nif (k.core_business === \"broker\")          flags.push(\"Pure broker\");\nif (k.core_business === \"owner_landlord\")  flags.push(\"Owner/landlord – separate pitch\");\nif ([\"developer\", \"other\"].includes(k.core_business)) flags.push(\"Not a property manager\");\nif (k.property_focus === \"commercial\")     flags.push(\"Commercial only\");\nif (k.sev_only)                            flags.push(\"SEV only – no building-level decision\");\nif (k.berlin_presence === \"none\")          flags.push(\"No Berlin presence\");\n\nlet priority;\nif (existing)                                     priority = \"Existing customer\";\nelse if (k.core_business === \"owner_landlord\")    priority = \"Strategic – separate pitch\";\nelse if (flags.length)                            priority = \"Not a target\";\nelse if (score >= 75)                             priority = \"A\";   // thresholds = KPI_Definitions B4:B5\nelse if (score >= 55)                             priority = \"B\";\nelse                                              priority = \"C\";\n\n// ---------- 7. review flags ----------\nconst review = [];\nif (k.conflicts) review.push(\"conflict: \" + k.conflicts);\nif (k.data_confidence === \"low\") review.push(\"low data confidence\");\nif (units > 50000 || emp > 5000) review.push(\"implausible number\");\nif (lead.generic_name === \"yes\") review.push(\"generic Google name – check legal_name\");\n\n// ---------- 8. contacts from the website ----------\nconst allEmails = (lead.emails_found || \"\").split(\",\").map(s => s.trim()).filter(Boolean);\nconst personal = (k.personal_emails || []).filter(e => allEmails.includes(e.toLowerCase()));\nconst general = allEmails.find(e => /^(info|kontakt|office|post|mail|hallo|hello|service|verwaltung)@/.test(e)) || allEmails.find(e => !personal.includes(e)) || \"\";\n\nconst yn = (b) => (b ? \"yes\" : \"no\");\nconst reasonPrefix = k.consolidator ? \"[Consolidator – strategic account] \" : \"\";\n\n// ---------- 9. output = exact sheet column names ----------\nreturn { json: {\n  place_id: lead.place_id,\n  status: \"enriched\",\n  segment: lead.segment || \"\",\n  legal_name: k.legal_name || \"\",\n  core_business: k.core_business || \"\",\n  manages_weg: yn(k.manages_weg),\n  manages_whole_buildings: yn(k.manages_whole_buildings),\n  does_billing: yn(k.does_billing),\n  property_focus: k.property_focus || \"\",\n  units_stated: (k.units_stated || \"\").replace(/\\s+/g, \" \"),\n  size_category: size,\n  digital_level: k.digital_level || \"\",\n  association: k.association || \"\",\n  energy_signal: yn(k.energy_signal),\n  growth_signal: yn(k.growth_signal),\n  own_metering: yn(k.own_metering),\n  consolidator: yn(k.consolidator),\n  existing_customer: yn(existing),\n  metering_providers: (k.metering_providers || []).join(\", \"),\n  berlin_presence: k.berlin_presence || \"\",\n  years_in_business: k.founding_year ? (new Date().getFullYear() - k.founding_year) : \"\",\n  score: score,\n  priority: priority,\n  red_flag: flags.join(\"; \"),\n  score_reason: reasonPrefix + (k.score_reason || \"\"),\n  score_breakdown: breakdown + (guardNotes.length ? ` | guardrails: ${guardNotes.join(\", \")}` : \"\"),\n  data_confidence: k.data_confidence || \"\",\n  needs_review: review.length ? \"yes – \" + review.join(\"; \") : \"no\",\n  general_email: general,\n  contact_name: k.decision_maker?.name || \"\",\n  contact_role: k.decision_maker?.role || \"\",\n  contact_email: personal[0] || \"\",\n  email_confidence: personal[0] ? \"Verified (on website)\" : \"\",\n  enriched_at: now,\n  evidence_urls: lead.evidence_urls || \"\",\n}};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1488,
+        -288
+      ],
+      "id": "5d48235e-563c-4812-9fff-c9b3aa2dce83",
+      "name": "Parse + guardrails + score"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e1f7f14e-03d6-4b2a-8706-d90e1082ab7f",
+              "leftValue": "={{ $json.crawl_ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1040,
+        -416
+      ],
+      "id": "decae870-f761-4797-b898-c86013f04e45",
+      "name": "IF crawl_ok"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "609ac24e-ab19-4a4d-abf6-72d7dca8f19f",
+              "leftValue": "={{ $json.enrich }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        448,
+        -144
+      ],
+      "id": "151dd2a5-46a4-422b-ae47-88284bd2636d",
+      "name": "IF enrich"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -176,
+        -192
+      ],
+      "id": "b4de93aa-f1a3-45fb-9dcb-8c47e43d7c7b",
+      "name": "Trigger"
+    },
+    {
+      "parameters": {
+        "batchSize": 5,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        736,
+        -288
+      ],
+      "id": "d08aabbb-1493-4ff8-8808-6782d405729a",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "place_id": "={{ $json.place_id }}",
+            "status": "={{ $json.status }}",
+            "legal_name": "={{ $json.legal_name }}",
+            "core_business": "={{ $json.core_business }}",
+            "manages_weg": "={{ $json.manages_weg }}",
+            "manages_whole_buildings": "={{ $json.manages_whole_buildings }}",
+            "does_billing": "={{ $json.does_billing }}",
+            "property_focus": "={{ $json.property_focus }}",
+            "units_stated": "={{ $json.units_stated }}",
+            "size_category": "={{ $json.size_category }}",
+            "digital_level": "={{ $json.digital_level }}",
+            "association": "={{ $json.association }}",
+            "energy_signal": "={{ $json.energy_signal }}",
+            "growth_signal": "={{ $json.growth_signal }}",
+            "own_metering": "={{ $json.own_metering }}",
+            "consolidator": "={{ $json.consolidator }}",
+            "existing_customer": "={{ $json.existing_customer }}",
+            "metering_providers": "={{ $json.metering_providers }}",
+            "berlin_presence": "={{ $json.berlin_presence }}",
+            "years_in_business": "={{ $json.years_in_business }}",
+            "score": "={{ $json.score }}",
+            "priority": "={{ $json.priority }}",
+            "red_flag": "={{ $json.red_flag }}",
+            "score_reason": "={{ $json.score_reason }}",
+            "score_breakdown": "={{ $json.score_breakdown }}",
+            "data_confidence": "={{ $json.data_confidence }}",
+            "needs_review": "={{ $json.needs_review }}",
+            "general_email": "={{ $json.general_email }}",
+            "contact_name": "={{ $json.contact_name }}",
+            "contact_role": "={{ $json.contact_role }}",
+            "contact_email": "={{ $json.contact_email }}",
+            "email_confidence": "={{ $json.email_confidence }}",
+            "evidence_urls": "={{ $json.evidence_urls }}",
+            "enriched_at": "={{ $json.enriched_at }}",
+            "segment": "={{ $json.segment }}"
+          },
+          "matchingColumns": [
+            "place_id"
+          ],
+          "schema": [
+            {
+              "id": "place_id",
+              "displayName": "place_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_name",
+              "displayName": "company_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "generic_name",
+              "displayName": "generic_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "street",
+              "displayName": "street",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "postal_code",
+              "displayName": "postal_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "district",
+              "displayName": "district",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "city",
+              "displayName": "city",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "phone",
+              "displayName": "phone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_category",
+              "displayName": "google_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "all_categories",
+              "displayName": "all_categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "broker_hint",
+              "displayName": "broker_hint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_rating",
+              "displayName": "google_rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_reviews",
+              "displayName": "google_reviews",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "maps_url",
+              "displayName": "maps_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "search_string",
+              "displayName": "search_string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "scraped_at",
+              "displayName": "scraped_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "legal_name",
+              "displayName": "legal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "core_business",
+              "displayName": "core_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_weg",
+              "displayName": "manages_weg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_whole_buildings",
+              "displayName": "manages_whole_buildings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "does_billing",
+              "displayName": "does_billing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "property_focus",
+              "displayName": "property_focus",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "units_stated",
+              "displayName": "units_stated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "size_category",
+              "displayName": "size_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "digital_level",
+              "displayName": "digital_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "association",
+              "displayName": "association",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "energy_signal",
+              "displayName": "energy_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "growth_signal",
+              "displayName": "growth_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "own_metering",
+              "displayName": "own_metering",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "consolidator",
+              "displayName": "consolidator",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "existing_customer",
+              "displayName": "existing_customer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "metering_providers",
+              "displayName": "metering_providers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "berlin_presence",
+              "displayName": "berlin_presence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "years_in_business",
+              "displayName": "years_in_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "red_flag",
+              "displayName": "red_flag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_reason",
+              "displayName": "score_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_breakdown",
+              "displayName": "score_breakdown",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "data_confidence",
+              "displayName": "data_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "needs_review",
+              "displayName": "needs_review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "general_email",
+              "displayName": "general_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_name",
+              "displayName": "contact_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_role",
+              "displayName": "contact_role",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_email",
+              "displayName": "contact_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_confidence",
+              "displayName": "email_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "linkedin_url",
+              "displayName": "linkedin_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enriched_at",
+              "displayName": "enriched_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_urls",
+              "displayName": "evidence_urls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enrich",
+              "displayName": "enrich",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1696,
+        80
+      ],
+      "id": "c01a3cfe-5bd1-4beb-af0f-be5c7ab4ed38",
+      "name": "Update lead",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "place_id": "={{ $json.place_id }}",
+            "status": "website_unreachable",
+            "red_flag": "={{ $json.crawl_error }}",
+            "needs_review": "yes – website could not be crawled"
+          },
+          "matchingColumns": [
+            "place_id"
+          ],
+          "schema": [
+            {
+              "id": "place_id",
+              "displayName": "place_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_name",
+              "displayName": "company_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "generic_name",
+              "displayName": "generic_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "street",
+              "displayName": "street",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "postal_code",
+              "displayName": "postal_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "district",
+              "displayName": "district",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "city",
+              "displayName": "city",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "phone",
+              "displayName": "phone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_category",
+              "displayName": "google_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "all_categories",
+              "displayName": "all_categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "broker_hint",
+              "displayName": "broker_hint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_rating",
+              "displayName": "google_rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_reviews",
+              "displayName": "google_reviews",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "maps_url",
+              "displayName": "maps_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "search_string",
+              "displayName": "search_string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "scraped_at",
+              "displayName": "scraped_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "legal_name",
+              "displayName": "legal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "core_business",
+              "displayName": "core_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_weg",
+              "displayName": "manages_weg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_whole_buildings",
+              "displayName": "manages_whole_buildings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "does_billing",
+              "displayName": "does_billing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "property_focus",
+              "displayName": "property_focus",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "units_stated",
+              "displayName": "units_stated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "size_category",
+              "displayName": "size_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "digital_level",
+              "displayName": "digital_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "association",
+              "displayName": "association",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "energy_signal",
+              "displayName": "energy_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "growth_signal",
+              "displayName": "growth_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "own_metering",
+              "displayName": "own_metering",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "consolidator",
+              "displayName": "consolidator",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "existing_customer",
+              "displayName": "existing_customer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "metering_providers",
+              "displayName": "metering_providers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "berlin_presence",
+              "displayName": "berlin_presence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "years_in_business",
+              "displayName": "years_in_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "red_flag",
+              "displayName": "red_flag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_reason",
+              "displayName": "score_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_breakdown",
+              "displayName": "score_breakdown",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "data_confidence",
+              "displayName": "data_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "needs_review",
+              "displayName": "needs_review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "general_email",
+              "displayName": "general_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_name",
+              "displayName": "contact_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_role",
+              "displayName": "contact_role",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_email",
+              "displayName": "contact_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_confidence",
+              "displayName": "email_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "linkedin_url",
+              "displayName": "linkedin_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enriched_at",
+              "displayName": "enriched_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_urls",
+              "displayName": "evidence_urls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enrich",
+              "displayName": "enrich",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1088,
+        0
+      ],
+      "id": "d9d0c805-39ef-43f9-a0f8-ea7b72f5dd03",
+      "name": "Update row – unreachable",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Leads",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "skipped",
+            "red_flag": "={{ { housing_company: \"Housing company – strategic, separate pitch\", irrelevant: \"Not a property manager\", outside_berlin: \"Outside Berlin\" }[$json.segment] }}",
+            "place_id": "={{ $json.place_id }}",
+            "segment": "={{ $json.segment }}"
+          },
+          "matchingColumns": [
+            "place_id"
+          ],
+          "schema": [
+            {
+              "id": "place_id",
+              "displayName": "place_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "company_name",
+              "displayName": "company_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "generic_name",
+              "displayName": "generic_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "street",
+              "displayName": "street",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "postal_code",
+              "displayName": "postal_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "district",
+              "displayName": "district",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "city",
+              "displayName": "city",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "phone",
+              "displayName": "phone",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_category",
+              "displayName": "google_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "all_categories",
+              "displayName": "all_categories",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "broker_hint",
+              "displayName": "broker_hint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_rating",
+              "displayName": "google_rating",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "google_reviews",
+              "displayName": "google_reviews",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "maps_url",
+              "displayName": "maps_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "search_string",
+              "displayName": "search_string",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "scraped_at",
+              "displayName": "scraped_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "legal_name",
+              "displayName": "legal_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "core_business",
+              "displayName": "core_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_weg",
+              "displayName": "manages_weg",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "manages_whole_buildings",
+              "displayName": "manages_whole_buildings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "does_billing",
+              "displayName": "does_billing",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "property_focus",
+              "displayName": "property_focus",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "units_stated",
+              "displayName": "units_stated",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "size_category",
+              "displayName": "size_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "digital_level",
+              "displayName": "digital_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "association",
+              "displayName": "association",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "energy_signal",
+              "displayName": "energy_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "growth_signal",
+              "displayName": "growth_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "own_metering",
+              "displayName": "own_metering",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "consolidator",
+              "displayName": "consolidator",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "existing_customer",
+              "displayName": "existing_customer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "metering_providers",
+              "displayName": "metering_providers",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "berlin_presence",
+              "displayName": "berlin_presence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "years_in_business",
+              "displayName": "years_in_business",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score",
+              "displayName": "score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "red_flag",
+              "displayName": "red_flag",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "score_reason",
+              "displayName": "score_reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "data_confidence",
+              "displayName": "data_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "needs_review",
+              "displayName": "needs_review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "general_email",
+              "displayName": "general_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_name",
+              "displayName": "contact_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_role",
+              "displayName": "contact_role",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_email",
+              "displayName": "contact_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_confidence",
+              "displayName": "email_confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "linkedin_url",
+              "displayName": "linkedin_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enriched_at",
+              "displayName": "enriched_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "evidence_urls",
+              "displayName": "evidence_urls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enrich",
+              "displayName": "enrich",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        480,
+        -448
+      ],
+      "id": "21de3f3d-2d36-4ff0-9387-e94f2e628a52",
+      "name": "Update row – skipped",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "name": "Google Sheets account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "amount": 1
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1904,
+        80
+      ],
+      "id": "626aeb8f-cbe6-4137-a407-4f65188ae6c1",
+      "name": "Wait"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Segment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Segment": {
+      "main": [
+        [
+          {
+            "node": "IF enrich",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crawl website": {
+      "main": [
+        [
+          {
+            "node": "IF crawl_ok",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Parse + guardrails + score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse + guardrails + score": {
+      "main": [
+        [
+          {
+            "node": "Update lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF crawl_ok": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update row – unreachable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF enrich": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update row – skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Crawl website",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update lead": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update row – unreachable": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "tags": []
+}
